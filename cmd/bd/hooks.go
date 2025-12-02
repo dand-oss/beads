@@ -19,7 +19,7 @@ var hooksFS embed.FS
 
 func getEmbeddedHooks() (map[string]string, error) {
 	hooks := make(map[string]string)
-	hookNames := []string{"pre-commit", "post-merge", "pre-push", "post-checkout"}
+	hookNames := []string{"pre-commit", "post-commit", "post-merge", "pre-push", "post-checkout"}
 
 	for _, name := range hookNames {
 		content, err := hooksFS.ReadFile("templates/hooks/" + name)
@@ -44,7 +44,7 @@ type HookStatus struct {
 
 // CheckGitHooks checks the status of bd git hooks in .git/hooks/
 func CheckGitHooks() []HookStatus {
-	hooks := []string{"pre-commit", "post-merge", "pre-push", "post-checkout"}
+	hooks := []string{"pre-commit", "post-commit", "post-merge", "pre-push", "post-checkout"}
 	statuses := make([]HookStatus, 0, len(hooks))
 
 	// Get actual git directory (handles worktrees)
@@ -355,7 +355,7 @@ func uninstallHooks() error {
 		return err
 	}
 	hooksDir := filepath.Join(gitDir, "hooks")
-	hookNames := []string{"pre-commit", "post-merge", "pre-push", "post-checkout"}
+	hookNames := []string{"pre-commit", "post-commit", "post-merge", "pre-push", "post-checkout"}
 
 	for _, hookName := range hookNames {
 		hookPath := filepath.Join(hooksDir, hookName)
