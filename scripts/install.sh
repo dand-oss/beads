@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Beads (bd) installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/dand-oss/beads/main/scripts/install.sh | bash
 #
 # ⚠️ IMPORTANT: This script must be EXECUTED, never SOURCED
 # ❌ WRONG: source install.sh (will exit your shell on errors)
@@ -113,7 +113,7 @@ verify_release_checksum() {
     local archive_path=$4
 
     local checksums_name="checksums.txt"
-    local checksums_url="https://github.com/gastownhall/beads/releases/download/${version}/${checksums_name}"
+    local checksums_url="https://github.com/dand-oss/beads/releases/download/${version}/${checksums_name}"
 
     if ! release_has_asset "$release_json" "$checksums_name"; then
         log_error "Release metadata is missing ${checksums_name}; refusing to install unverified binary"
@@ -210,7 +210,7 @@ detect_platform() {
             echo "" >&2
             echo "  This bash installer is for macOS/Linux. On Windows, use the PowerShell installer:" >&2
             echo "" >&2
-            echo "    irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex" >&2
+            echo "    irm https://raw.githubusercontent.com/dand-oss/beads/main/install.ps1 | iex" >&2
             echo "" >&2
             exit 1
             ;;
@@ -225,7 +225,7 @@ detect_platform() {
         echo "  This will install the Linux version of bd, usable only inside WSL." >&2
         echo "  If you want bd available in native Windows (PowerShell, cmd), use:" >&2
         echo "" >&2
-        echo "    irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex" >&2
+        echo "    irm https://raw.githubusercontent.com/dand-oss/beads/main/install.ps1 | iex" >&2
         echo "" >&2
         # Only show interactive message and pause if running in a terminal (skip in CI/non-interactive shells)
         if [ -t 0 ]; then
@@ -295,7 +295,7 @@ install_from_release() {
 
     # Get latest release version
     log_info "Fetching latest release..."
-    local latest_url="https://api.github.com/repos/gastownhall/beads/releases/latest"
+    local latest_url="https://api.github.com/repos/dand-oss/beads/releases/latest"
     local version
     local release_json
 
@@ -319,7 +319,7 @@ install_from_release() {
 
     # Download URL
     local archive_name="beads_${version#v}_${platform}.tar.gz"
-    local download_url="https://github.com/gastownhall/beads/releases/download/${version}/${archive_name}"
+    local download_url="https://github.com/dand-oss/beads/releases/download/${version}/${archive_name}"
 
     if ! release_has_asset "$release_json" "$archive_name"; then
         log_warning "No prebuilt archive available for platform ${platform}. Falling back to source installation methods."
@@ -482,9 +482,7 @@ install_with_go() {
         bin_dir="$(go env GOPATH)/bin"
     fi
 
-    # The repository lives under gastownhall, but the Go module path remains
-    # github.com/steveyegge/beads for compatibility with released tags.
-    if CGO_ENABLED=1 GOFLAGS="${GOFLAGS:+$GOFLAGS }-tags=gms_pure_go" go install github.com/steveyegge/beads/cmd/bd@latest; then
+    if CGO_ENABLED=1 GOFLAGS="${GOFLAGS:+$GOFLAGS }-tags=gms_pure_go" go install github.com/dand-oss/beads/cmd/bd@latest; then
         log_success "bd installed via go install (embedded-capable)"
         LAST_INSTALL_PATH="$bin_dir/bd"
 
@@ -493,7 +491,7 @@ install_with_go() {
         fi
     else
         log_warning "go install with CGO failed; retrying without CGO (server-mode-only binary)"
-        if CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest; then
+        if CGO_ENABLED=0 go install github.com/dand-oss/beads/cmd/bd@latest; then
             log_success "bd installed via go install (CGO_ENABLED=0, server mode only)"
             log_warning "This bd cannot use embedded Dolt. Run 'bd init --server' to use an external dolt sql-server, or reinstall with a C toolchain for embedded mode."
             LAST_INSTALL_PATH="$bin_dir/bd"
@@ -526,75 +524,59 @@ install_with_go() {
 build_from_source() {
     log_info "Building bd from source..."
 
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    local repo_root="$(dirname "$script_dir")"
 
-    cd "$tmp_dir"
-    log_info "Cloning repository..."
-
-    if git clone --depth 1 https://github.com/gastownhall/beads.git; then
-        cd beads
-        log_info "Building binary..."
-
-        if CGO_ENABLED=1 go build -tags gms_pure_go -o bd ./cmd/bd; then
-            if ! verify_binary_has_cgo "./bd" "source build"; then
-                cd - > /dev/null || cd "$HOME"
-                rm -rf "$tmp_dir"
-                return 1
-            fi
-
-            # Determine install location
-            local install_dir
-            if [[ -w /usr/local/bin ]]; then
-                install_dir="/usr/local/bin"
-            else
-                install_dir="$HOME/.local/bin"
-                mkdir -p "$install_dir"
-            fi
-
-            log_info "Installing to $install_dir..."
-            if [[ -w "$install_dir" ]]; then
-                mv bd "$install_dir/"
-            else
-                sudo mv bd "$install_dir/"
-            fi
-
-            # Optional local ad-hoc re-sign for macOS (off by default)
-            resign_for_macos "$install_dir/bd"
-
-            # Create 'beads' alias symlink
-            create_beads_alias "$install_dir"
-
-            log_success "bd installed to $install_dir/bd"
-
-            # Record where we installed the binary when building from source
-            LAST_INSTALL_PATH="$install_dir/bd"
-
-            # Check if install_dir is in PATH
-            if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-                log_warning "$install_dir is not in your PATH"
-                echo ""
-                echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-                echo "  export PATH=\"\$PATH:$install_dir\""
-                echo ""
-            fi
-
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
-            return 0
-        else
-            log_error "Build failed"
-            print_missing_build_deps_help
-            cd - > /dev/null || cd "$HOME"
-            cd - > /dev/null
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-    else
-        log_error "Failed to clone repository"
-        rm -rf "$tmp_dir"
+    if [[ ! -f "$repo_root/go.mod" || ! -d "$repo_root/cmd/bd" ]]; then
+        log_error "install.sh must be run from inside a beads checkout (expected $repo_root/go.mod and $repo_root/cmd/bd)"
         return 1
     fi
+
+    cd "$repo_root"
+    log_info "Building binary in $repo_root..."
+
+    if ! CGO_ENABLED=1 go build -tags gms_pure_go -o bd ./cmd/bd; then
+        log_error "Build failed"
+        print_missing_build_deps_help
+        return 1
+    fi
+
+    if ! verify_binary_has_cgo "./bd" "source build"; then
+        rm -f bd
+        return 1
+    fi
+
+    local install_dir
+    if [[ -w /usr/local/bin ]]; then
+        install_dir="/usr/local/bin"
+    else
+        install_dir="$HOME/.local/bin"
+        mkdir -p "$install_dir"
+    fi
+
+    log_info "Installing to $install_dir..."
+    if [[ -w "$install_dir" ]]; then
+        mv bd "$install_dir/"
+    else
+        sudo mv bd "$install_dir/"
+    fi
+
+    resign_for_macos "$install_dir/bd"
+    create_beads_alias "$install_dir"
+
+    log_success "bd installed to $install_dir/bd"
+    LAST_INSTALL_PATH="$install_dir/bd"
+
+    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+        log_warning "$install_dir is not in your PATH"
+        echo ""
+        echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+        echo "  export PATH=\"\$PATH:$install_dir\""
+        echo ""
+    fi
+
+    return 0
 }
 
 # Verify installation
@@ -705,24 +687,24 @@ main() {
     platform=$(detect_platform)
     log_info "Platform: $platform"
 
-    # Try downloading from GitHub releases first
-    if install_from_release "$platform"; then
-        verify_installation
-        exit 0
-    fi
+    # # Try downloading from GitHub releases first
+    # if install_from_release "$platform"; then
+    #     verify_installation
+    #     exit 0
+    # fi
 
-    log_warning "Failed to install from releases, trying alternative methods..."
+    # log_warning "Failed to install from releases, trying alternative methods..."
 
-    # Try go install as fallback
-    if check_go; then
-        if install_with_go; then
-            verify_installation
-            exit 0
-        fi
-    fi
+    # # Try go install as fallback
+    # if check_go; then
+    #     if install_with_go; then
+    #         verify_installation
+    #         exit 0
+    #     fi
+    # fi
 
-    # Try building from source as last resort
-    log_warning "Falling back to building from source..."
+    # Build from source only
+    log_info "Building from source..."
 
     if ! check_go; then
         log_warning "Go is not installed"
@@ -747,13 +729,13 @@ main() {
     log_error "Installation failed"
     echo ""
     echo "Manual installation:"
-    echo "  1. Download from https://github.com/gastownhall/beads/releases/latest"
+    echo "  1. Download from https://github.com/dand-oss/beads/releases/latest"
     echo "  2. Verify SHA256 checksum against checksums.txt"
     echo "  3. Extract and move 'bd' to your PATH"
     echo ""
     echo "Or install from source:"
     echo "  1. Install Go from https://go.dev/dl/"
-    echo "  2. Run: CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest"
+    echo "  2. Run: CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/dand-oss/beads/cmd/bd@latest"
     echo ""
     exit 1
 }
