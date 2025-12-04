@@ -144,20 +144,27 @@ func gitCommitInWorktree(ctx context.Context, worktreePath, filePath, message st
 	if err != nil {
 		return fmt.Errorf("failed to make path relative: %w", err)
 	}
-	
+
 	// Stage the file
 	addCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "add", relPath) // #nosec G204 - worktreePath and relPath are derived from trusted git operations
 	if err := addCmd.Run(); err != nil {
 		return fmt.Errorf("git add failed in worktree: %w", err)
 	}
-	
+
+	// Check if anything was actually staged (exit code 1 = differences exist)
+	diffCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "diff", "--cached", "--quiet", relPath) // #nosec G204 - worktreePath and relPath are derived from trusted git operations
+	if diffCmd.Run() == nil {
+		// No staged changes - nothing to commit
+		return nil
+	}
+
 	// Commit
 	commitCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "commit", "-m", message)
 	output, err := commitCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git commit failed in worktree: %w\n%s", err, output)
 	}
-	
+
 	return nil
 }
 
