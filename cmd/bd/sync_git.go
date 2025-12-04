@@ -205,6 +205,13 @@ func gitCommit(ctx context.Context, filePath string, message string) error {
 		return fmt.Errorf("git add failed: %w", err)
 	}
 
+	// Check if anything was actually staged (exit code 1 = differences exist)
+	diffCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", filePath)
+	if diffCmd.Run() == nil {
+		// No staged changes - nothing to commit
+		return nil
+	}
+
 	// Generate message if not provided
 	if message == "" {
 		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
@@ -267,6 +274,13 @@ func gitCommitBeadsDir(ctx context.Context, message string) error {
 	addCmd := rc.GitCmd(ctx, addArgs...)
 	if err := addCmd.Run(); err != nil {
 		return fmt.Errorf("git add failed: %w", err)
+	}
+
+	// Check if anything was actually staged in .beads/ (exit code 1 = differences exist)
+	diffCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--", beadsDir) //nolint:gosec // G204: beadsDir from FindBeadsDir()
+	if diffCmd.Run() == nil {
+		// No staged changes - nothing to commit
+		return nil
 	}
 
 	// Generate message if not provided

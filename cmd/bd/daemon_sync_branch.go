@@ -178,6 +178,13 @@ func gitCommitInWorktree(ctx context.Context, worktreePath, filePath, message st
 		return fmt.Errorf("git add failed in worktree: %w", err)
 	}
 
+	// Check if anything was actually staged (exit code 1 = differences exist)
+	diffCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "diff", "--cached", "--quiet", relPath) // #nosec G204 - worktreePath and relPath are derived from trusted git operations
+	if diffCmd.Run() == nil {
+		// No staged changes - nothing to commit
+		return nil
+	}
+
 	// Build commit args with config-based author and signing options (GH#1051)
 	// Also use --no-verify to skip hooks (pre-commit hook would fail in worktree context)
 	// The worktree is internal to bd sync, so we don't need to run bd's pre-commit hook
