@@ -1,37 +1,395 @@
 #!/usr/bin/env bash
-#
-# Beads (bd) installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-#
-# ⚠️ IMPORTANT: This script must be EXECUTED, never SOURCED
-# ❌ WRONG: source install.sh (will exit your shell on errors)
-# ✅ CORRECT: bash install.sh
-# ✅ CORRECT: curl -fsSL ... | bash
-#
+set -euo pipefail
 
-set -e
+REPO_OWNER="dand-oss"
+REPO_NAME="beads"
+BIN_NAME="bd"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+TMP_DIRS=()
 
-log_info() {
-    echo -e "${BLUE}==>${NC} $1"
+cleanup_tmp_dirs() {
+    local dir
+    # Use ${array[@]+"${array[@]}"} pattern to avoid unbound variable error
+    # when TMP_DIRS is empty with set -u enabled
+    for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
+        [ -n "$dir" ] && rm -rf "$dir"
+    done
 }
 
-log_success() {
-    echo -e "${GREEN}==>${NC} $1"
+make_tmp_dir() {
+    local dir
+    dir=$(mktemp -d)
+    TMP_DIRS+=("$dir")
+    printf '%s\n' "$dir"
 }
 
-log_warning() {
-    echo -e "${YELLOW}==>${NC} $1"
+trap cleanup_tmp_dirs EXIT
+
+default_install_dir() {
+    if [ -n "${INSTALL_DIR:-}" ]; then
+        echo "$INSTALL_DIR"
+        return
+    fi
+
+    # Prefer ~/.local/bin (user-local, no sudo required)
+    local local_bin="$HOME/.local/bin"
+    if [ -d "$local_bin" ] && [ -w "$local_bin" ]; then
+        echo "$local_bin"
+        return
+    fi
+
+    # Create ~/.local/bin if it doesn't exist
+    if [ -n "$HOME" ] && mkdir -p "$local_bin" 2>/dev/null; then
+        echo "$local_bin"
+        return
+    fi
+
+    # Fallback to Homebrew/standard prefixes on macOS
+    for dir in /usr/local/bin /opt/homebrew/bin /opt/local/bin; do
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            echo "$dir"
+            return
+        fi
+    done
+
+    # Fall back to the first writable entry in PATH
+    IFS=: read -r -a path_entries <<<"${PATH:-}"
+    for dir in "${path_entries[@]}"; do
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            echo "$dir"
+            return
+        fi
+    done
+
+    echo "$HOME/.local/bin"
 }
 
-log_error() {
-    echo -e "${RED}Error:${NC} $1" >&2
+INSTALL_DIR="$(default_install_dir)"
+
+print_info() { printf "\033[1;34m==>\033[0m %s\n" "$1"; }
+print_success() { printf "\033[1;32m==>\033[0m %s\n" "$1"; }
+print_error() { printf "\033[1;31m==>\033[0m %s\n" "$1"; }
+print_warn() { printf "\033[1;33m==>\033[0m %s\n" "$1"; }
+
+detect_platform() {
+    local os arch
+
+    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    arch="$(uname -m)"
+
+    case "$os" in
+        linux) os="linux" ;;
+        darwin) os="darwin" ;;
+        mingw*|msys*|cygwin*) os="windows" ;;
+        *) print_error "Unsupported OS: $os"; return 1 ;;
+    esac
+
+    case "$arch" in
+        x86_64|amd64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) print_error "Unsupported architecture: $arch"; return 1 ;;
+    esac
+
+    echo "${os}_${arch}"
+}
+
+get_latest_release() {
+    local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$url" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$dest" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$dest" || return 1
+    else
+        return 1
+    fi
+}
+
+ensure_install_dir() {
+    local dir="$1"
+
+    if [ -d "$dir" ]; then
+        return 0
+    fi
+
+    if mkdir -p "$dir" 2>/dev/null; then
+        return 0
+    fi
+
+    print_info "Creating $dir requires sudo..."
+    sudo mkdir -p "$dir"
+}
+
+PYTHON_CMD=""
+
+ensure_python() {
+    if [ -n "$PYTHON_CMD" ]; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD="$(command -v python3)"
+        return 0
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_CMD="$(command -v python)"
+        return 0
+    fi
+
+    print_error "Python 3 is required to parse GitHub release metadata."
+    print_error "Please install python3 (e.g., 'xcode-select --install' on macOS) or install jq."
+    return 1
+}
+
+fetch_latest_go_pkg() {
+    # Emits: version<newline>url (for macOS .pkg matching current arch)
+    ensure_python || return 1
+
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64|amd64) arch="amd64" ;;
+        *) print_error "Unsupported macOS architecture for Go install: $arch"; return 1 ;;
+    esac
+
+    "$PYTHON_CMD" - "$arch" <<'PY'
+import json
+import sys
+import urllib.request
+
+
+def main() -> int:
+    arch = sys.argv[1]
+    try:
+        with urllib.request.urlopen("https://go.dev/dl/?mode=json") as resp:
+            data = json.load(resp)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"Failed to fetch Go releases: {exc}\n")
+        return 1
+
+    release = next((r for r in data if r.get("stable")), None)
+    if not release:
+        return 1
+
+    version = release.get("version") or ""
+    files = release.get("files") or []
+    pkg = next(
+        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and f.get("filename", "").endswith(".pkg")),
+        None,
+    )
+
+    if not pkg:
+        return 1
+
+    url = pkg.get("url") or ""
+    print(version)
+    print(url)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+}
+
+install_go_from_pkg() {
+    local version url tmpdir pkg_path
+
+    read -r version url < <(fetch_latest_go_pkg) || return 1
+
+    if [ -z "$version" ] || [ -z "$url" ]; then
+        return 1
+    fi
+
+    print_info "Downloading Go $version (.pkg)..."
+    tmpdir=$(mktemp -d)
+    pkg_path="$tmpdir/go.pkg"
+
+    if ! curl -fsSL "$url" -o "$pkg_path"; then
+        print_error "Failed to download Go installer from $url"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    print_info "Installing Go $version (requires sudo)..."
+    if sudo installer -pkg "$pkg_path" -target / >/dev/null; then
+        print_success "Installed Go $version"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+
+    print_error "Go installer failed"
+    rm -rf "$tmpdir"
+    return 1
+}
+
+version_ge() {
+    # Returns 0 if $1 >= $2 (both are dot-separated numeric strings)
+    local IFS=.
+    local i ver1=($1) ver2=($2)
+    for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
+        local v1=${ver1[i]:-0}
+        local v2=${ver2[i]:-0}
+        if ((10#$v1 > 10#$v2)); then return 0; fi
+        if ((10#$v1 < 10#$v2)); then return 1; fi
+    done
+    return 0
+}
+
+select_release_asset() {
+    local platform="$1"
+    ensure_python || return 1
+
+    local release_json
+    release_json=$(cat) || return 1
+
+    BD_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$platform" "$BIN_NAME" <<'PY'
+import json
+import os
+import sys
+
+
+def pick_asset(data, platform, bin_name):
+    ext = ".zip" if platform.startswith("windows_") else ".tar.gz"
+    assets = data.get("assets") or []
+
+    # Prefer exact platform match with expected ext
+    for asset in assets:
+        name = asset.get("name") or ""
+        if platform in name and name.endswith(ext):
+            url = asset.get("browser_download_url") or ""
+            if url:
+                return name, url
+
+    # Fallback: any asset that contains platform and correct ext
+    for asset in assets:
+        name = asset.get("name") or ""
+        url = asset.get("browser_download_url") or ""
+        if platform.replace("_", "") in name.replace("_", "") and name.endswith(ext) and url:
+            return name, url
+
+    return None, None
+
+
+def main():
+    if len(sys.argv) < 3:
+        return 1
+    platform = sys.argv[1]
+    bin_name = sys.argv[2]
+    release_json = os.environ.get("BD_RELEASE_JSON", "")
+    if not release_json:
+        sys.stderr.write("Missing release metadata\n")
+        return 1
+    try:
+        data = json.loads(release_json)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"Failed to parse release JSON: {exc}\n")
+        return 1
+
+    version = data.get("tag_name") or ""
+    name, url = pick_asset(data, platform, bin_name)
+
+    print(version)
+    print(url or "")
+    print(name or "")
+
+    return 0 if url else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+}
+
+is_tty() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+ensure_go() {
+    local min_version="1.24"
+    local go_version=""
+
+    if command -v go >/dev/null 2>&1; then
+        go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        if version_ge "$go_version" "$min_version"; then
+            printf '%s' "$go_version"
+            return 0
+        fi
+        print_warn "Go $min_version or later is required. Found: go$go_version"
+    else
+        print_warn "Go is not installed."
+    fi
+
+    # Try to install/upgrade via Homebrew on macOS
+    if command -v brew >/dev/null 2>&1; then
+        if is_tty; then
+            printf "Install/upgrade Go via Homebrew now? [Y/n] "
+            read -r reply
+            if [[ "$reply" =~ ^[Nn] ]]; then
+                return 1
+            fi
+        else
+            print_info "Attempting non-interactive install of Go via Homebrew..."
+        fi
+
+        if brew install go || brew upgrade go; then
+            go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+            if version_ge "$go_version" "$min_version"; then
+                print_success "Installed Go $go_version via Homebrew"
+                printf '%s' "$go_version"
+                return 0
+            fi
+        else
+            print_error "Homebrew installation of Go failed."
+        fi
+    else
+        print_warn "Homebrew not found."
+    fi
+
+    # Fallback: download official macOS pkg directly
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if is_tty; then
+            printf "Download and install the latest Go from go.dev now? [Y/n] "
+            read -r reply
+            if [[ "$reply" =~ ^[Nn] ]]; then
+                return 1
+            fi
+        else
+            print_info "Attempting non-interactive Go install via official pkg..."
+        fi
+
+        if install_go_from_pkg; then
+            # Try common locations before giving up (pkg installs to /usr/local/go/bin)
+            local candidates=( "go" "/usr/local/go/bin/go" "/usr/local/bin/go" )
+            for candidate in "${candidates[@]}"; do
+                if command -v "$candidate" >/dev/null 2>&1; then
+                    go_version=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+                    if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
+                        print_success "Detected Go $go_version after pkg install"
+                        printf '%s' "$go_version"
+                        return 0
+                    fi
+                fi
+            done
+        fi
+    fi
+
+    return 1
 }
 
 release_has_asset() {
@@ -46,7 +404,6 @@ release_has_asset() {
 }
 
 # Re-sign binary for macOS to avoid slow Gatekeeper checks
-# See: https://github.com/steveyegge/beads/issues/466
 resign_for_macos() {
     local binary_path=$1
 
@@ -57,471 +414,210 @@ resign_for_macos() {
 
     # Check if codesign is available
     if ! command -v codesign &> /dev/null; then
-        log_warning "codesign not found, skipping re-signing"
+        print_warn "codesign not found, skipping re-signing"
         return 0
     fi
 
-    log_info "Re-signing binary for macOS..."
+    print_info "Re-signing binary for macOS..."
     codesign --remove-signature "$binary_path" 2>/dev/null || true
     if codesign --force --sign - "$binary_path"; then
-        log_success "Binary re-signed for this machine"
+        print_success "Binary re-signed for this machine"
     else
-        log_warning "Failed to re-sign binary (non-fatal)"
+        print_warn "Failed to re-sign binary (non-fatal)"
     fi
 }
 
-# Detect OS and architecture
-detect_platform() {
-    local os arch
-
-    case "$(uname -s)" in
-        Darwin)
-            os="darwin"
-            ;;
-        Linux)
-            os="linux"
-            ;;
-        FreeBSD)
-            os="freebsd"
-            ;;
-        *)
-            log_error "Unsupported operating system: $(uname -s)"
-            exit 1
-            ;;
-    esac
-
-    case "$(uname -m)" in
-        x86_64|amd64)
-            arch="amd64"
-            ;;
-        aarch64|arm64)
-            arch="arm64"
-            ;;
-        armv7*|armv6*|armhf|arm)
-            arch="arm"
-            ;;
-        *)
-            log_error "Unsupported architecture: $(uname -m)"
-            exit 1
-            ;;
-    esac
-
-    echo "${os}_${arch}"
-}
-
-# Stop existing daemons before upgrade (safe for fresh installs)
-stop_existing_daemons() {
-    # Skip if bd isn't installed (fresh install)
-    if ! command -v bd &> /dev/null; then
-        return 0
-    fi
-
-    log_info "Stopping existing bd daemons before upgrade..."
-
-    # Try graceful shutdown via bd daemons killall
-    if bd daemons killall 2>/dev/null; then
-        log_success "Stopped existing daemons"
-    else
-        log_warning "No daemons running or failed to stop (continuing anyway)"
-    fi
-
-    return 0
-}
-
-# Download and install from GitHub releases
-install_from_release() {
-    log_info "Installing bd from GitHub releases..."
-
-    local platform=$1
+try_binary_install() {
+    local platform="$1"
     local tmp_dir
-    tmp_dir=$(mktemp -d)
 
-    # Get latest release version
-    log_info "Fetching latest release..."
-    local latest_url="https://api.github.com/repos/steveyegge/beads/releases/latest"
-    local version
+    print_info "Checking for pre-built binary..."
+
+    # Get latest release info
     local release_json
+    release_json=$(get_latest_release) || return 1
 
-    if command -v curl &> /dev/null; then
-        release_json=$(curl -fsSL "$latest_url")
-    elif command -v wget &> /dev/null; then
-        release_json=$(wget -qO- "$latest_url")
-    else
-        log_error "Neither curl nor wget found. Please install one of them."
+    local parsed version download_url asset_name
+    parsed=$(printf '%s' "$release_json" | select_release_asset "$platform") || true
+
+    version=$(printf '%s' "$parsed" | sed -n '1p')
+    download_url=$(printf '%s' "$parsed" | sed -n '2p')
+    asset_name=$(printf '%s' "$parsed" | sed -n '3p')
+
+    if [ -z "$download_url" ]; then
+        print_warn "No pre-built binary found for $platform"
         return 1
     fi
-
-    version=$(echo "$release_json" | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
 
     if [ -z "$version" ]; then
-        log_error "Failed to fetch latest version"
+        version="unknown"
+    fi
+
+    print_info "Latest release: $version"
+    if [ -n "$asset_name" ]; then
+        print_info "Selected asset: $asset_name"
+    fi
+
+    print_info "Downloading $download_url..."
+
+    tmp_dir=$(make_tmp_dir)
+
+    local ext=".tar.gz"
+    if [[ "$download_url" == *.zip ]]; then
+        ext=".zip"
+    fi
+
+    local archive_path="$tmp_dir/archive${ext}"
+
+    if ! download_file "$download_url" "$archive_path"; then
+        print_warn "Download failed"
         return 1
     fi
 
-    log_info "Latest version: $version"
+    # Extract the binary
+    print_info "Extracting..."
 
-    # Download URL
-    local archive_name="beads_${version#v}_${platform}.tar.gz"
-    local download_url="https://github.com/steveyegge/beads/releases/download/${version}/${archive_name}"
-
-    if ! release_has_asset "$release_json" "$archive_name"; then
-        log_warning "No prebuilt archive available for platform ${platform}. Falling back to source installation methods."
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    
-    log_info "Downloading $archive_name..."
-    
-    cd "$tmp_dir"
-    if command -v curl &> /dev/null; then
-        if ! curl -fsSL -o "$archive_name" "$download_url"; then
-            log_error "Download failed"
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
+    if [[ "$ext" == ".zip" ]]; then
+        if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$archive_path" -d "$tmp_dir"
+        else
+            print_warn "unzip not found"
             return 1
         fi
-    elif command -v wget &> /dev/null; then
-        if ! wget -q -O "$archive_name" "$download_url"; then
-            log_error "Download failed"
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
+    else
+        tar -xzf "$archive_path" -C "$tmp_dir"
     fi
 
-    # Extract archive
-    log_info "Extracting archive..."
-    if ! tar -xzf "$archive_name"; then
-        log_error "Failed to extract archive"
-        rm -rf "$tmp_dir"
+    # Find the binary in extracted contents
+    local binary_path
+    binary_path=$(find "$tmp_dir" -type f -name "$BIN_NAME" -perm -111 2>/dev/null | head -1)
+
+    if [ -z "$binary_path" ]; then
+        # Try without executable check (for freshly extracted files)
+        binary_path=$(find "$tmp_dir" -type f -name "$BIN_NAME" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$binary_path" ] && [[ "$platform" == windows_* ]]; then
+        binary_path=$(find "$tmp_dir" -type f -name "${BIN_NAME}.exe" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$binary_path" ]; then
+        print_warn "Binary not found in archive"
         return 1
     fi
 
-    # Determine install location
-    local install_dir
-    if [[ -w /usr/local/bin ]]; then
-        install_dir="/usr/local/bin"
-    else
-        install_dir="$HOME/.local/bin"
-        mkdir -p "$install_dir"
-    fi
+    chmod +x "$binary_path"
 
-    # Install binary
-    log_info "Installing to $install_dir..."
-    if [[ -w "$install_dir" ]]; then
-        mv bd "$install_dir/"
+    # Install to destination
+    ensure_install_dir "$INSTALL_DIR"
+    local dest_path="$INSTALL_DIR/$BIN_NAME"
+
+    if [ -w "$INSTALL_DIR" ]; then
+        mv "$binary_path" "$dest_path"
     else
-        sudo mv bd "$install_dir/"
+        print_info "Installing to $INSTALL_DIR requires sudo..."
+        sudo mv "$binary_path" "$dest_path"
     fi
 
     # Re-sign for macOS to avoid Gatekeeper delays
-    resign_for_macos "$install_dir/bd"
+    resign_for_macos "$dest_path"
 
-    log_success "bd installed to $install_dir/bd"
-
-    # Check if install_dir is in PATH
-    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-        log_warning "$install_dir is not in your PATH"
-        echo ""
-        echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo "  export PATH=\"\$PATH:$install_dir\""
-        echo ""
-    fi
-
-    cd - > /dev/null || cd "$HOME"
-    rm -rf "$tmp_dir"
+    print_success "Installed $BIN_NAME $version to $dest_path"
     return 0
 }
 
-# Check if Go is installed and meets minimum version
-check_go() {
-    if command -v go &> /dev/null; then
-        local go_version=$(go version | awk '{print $3}' | sed 's/go//')
-        log_info "Go detected: $(go version)"
+try_go_install() {
+    print_info "Attempting to build from source with go build..."
 
-        # Extract major and minor version numbers
-    local major=$(echo "$go_version" | cut -d. -f1)
-    local minor=$(echo "$go_version" | cut -d. -f2)
-
-    # Check if Go version is 1.24 or later
-    if [ "$major" -eq 1 ] && [ "$minor" -lt 24 ]; then
-        log_error "Go 1.24 or later is required (found: $go_version)"
-            echo ""
-            echo "Please upgrade Go:"
-            echo "  - Download from https://go.dev/dl/"
-            echo "  - Or use your package manager to update"
-            echo ""
-            return 1
-        fi
-
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Install using go install (fallback)
-install_with_go() {
-    log_info "Installing bd using 'go install'..."
-
-    if go install github.com/steveyegge/beads/cmd/bd@latest; then
-        log_success "bd installed successfully via go install"
-
-        # Record where we expect the binary to have been installed
-        # Prefer GOBIN if set, otherwise GOPATH/bin
-        local gobin
-        gobin=$(go env GOBIN 2>/dev/null || true)
-        if [ -n "$gobin" ]; then
-            bin_dir="$gobin"
-        else
-            bin_dir="$(go env GOPATH)/bin"
-        fi
-        LAST_INSTALL_PATH="$bin_dir/bd"
-
-        # Re-sign for macOS to avoid Gatekeeper delays
-        resign_for_macos "$bin_dir/bd"
-
-        # Check if GOPATH/bin (or GOBIN) is in PATH
-        if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
-            log_warning "$bin_dir is not in your PATH"
-            echo ""
-            echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-            echo "  export PATH=\"\$PATH:$bin_dir\""
-            echo ""
-        fi
-
-        return 0
-    else
-        log_error "go install failed"
-        return 1
-    fi
-}
-
-# Build from source (last resort)
-build_from_source() {
-    log_info "Building bd from source..."
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    cd "$tmp_dir"
-    log_info "Cloning repository..."
-
-    if git clone --depth 1 https://github.com/steveyegge/beads.git; then
-        cd beads
-        log_info "Building binary..."
-
-        if go build -o bd ./cmd/bd; then
-            # Determine install location
-            local install_dir
-            if [[ -w /usr/local/bin ]]; then
-                install_dir="/usr/local/bin"
-            else
-                install_dir="$HOME/.local/bin"
-                mkdir -p "$install_dir"
-            fi
-
-            log_info "Installing to $install_dir..."
-            if [[ -w "$install_dir" ]]; then
-                mv bd "$install_dir/"
-            else
-                sudo mv bd "$install_dir/"
-            fi
-
-            # Re-sign for macOS to avoid Gatekeeper delays
-            resign_for_macos "$install_dir/bd"
-
-            log_success "bd installed to $install_dir/bd"
-
-            # Record where we installed the binary when building from source
-            LAST_INSTALL_PATH="$install_dir/bd"
-
-            # Check if install_dir is in PATH
-            if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-                log_warning "$install_dir is not in your PATH"
-                echo ""
-                echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-                echo "  export PATH=\"\$PATH:$install_dir\""
-                echo ""
-            fi
-
-            cd - > /dev/null || cd "$HOME"
-            rm -rf "$tmp_dir"
-            return 0
-        else
-            log_error "Build failed"
-    cd - > /dev/null || cd "$HOME"
-            cd - > /dev/null
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-    else
-        log_error "Failed to clone repository"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-}
-
-# Verify installation
-verify_installation() {
-    # If multiple 'bd' binaries exist on PATH, warn the user before verification
-    warn_if_multiple_bd || true
-
-    if command -v bd &> /dev/null; then
-        log_success "bd is installed and ready!"
-        echo ""
-        bd version 2>/dev/null || echo "bd (development build)"
-        echo ""
-        echo "Get started:"
-        echo "  cd your-project"
-        echo "  bd init"
-        echo "  bd quickstart"
-        echo ""
-        return 0
-    else
-        log_error "bd was installed but is not in PATH"
-        return 1
-    fi
-}
-
-# Returns a list of full paths to 'bd' found in PATH (earlier entries first)
-get_bd_paths_in_path() {
-    local IFS=':'
-    local -a entries
-    read -ra entries <<< "$PATH"
-    local -a found
-    local p
-    for p in "${entries[@]}"; do
-        [ -z "$p" ] && continue
-        if [ -x "$p/bd" ]; then
-            # Resolve symlink if possible
-            if command -v readlink >/dev/null 2>&1; then
-                resolved=$(readlink -f "$p/bd" 2>/dev/null || printf '%s' "$p/bd")
-            else
-                resolved="$p/bd"
-            fi
-            # avoid duplicates
-            skip=0
-            for existing in "${found[@]:-}"; do
-                if [ "$existing" = "$resolved" ]; then skip=1; break; fi
-            done
-            if [ $skip -eq 0 ]; then
-                found+=("$resolved")
-            fi
-        fi
-    done
-    # print results, one per line
-    for item in "${found[@]:-}"; do
-        printf '%s\n' "$item"
-    done
-}
-
-warn_if_multiple_bd() {
-    # Use bash 3.2-compatible approach instead of mapfile (bash 4.0+)
-    bd_paths=()
-    while IFS= read -r line; do
-        bd_paths+=("$line")
-    done < <(get_bd_paths_in_path)
-    if [ "${#bd_paths[@]}" -le 1 ]; then
-        return 0
-    fi
-
-    log_warning "Multiple 'bd' executables found on your PATH. An older copy may be executed instead of the one we installed."
-    echo "Found the following 'bd' executables (entries earlier in PATH take precedence):"
-    local i=1
-    for p in "${bd_paths[@]}"; do
-        local ver
-        if [ -x "$p" ]; then
-            ver=$("$p" version 2>/dev/null || true)
-        fi
-        if [ -z "$ver" ]; then ver="<unknown version>"; fi
-        echo "  $i. $p  -> $ver"
-        i=$((i+1))
-    done
-
-    if [ -n "$LAST_INSTALL_PATH" ]; then
-        echo ""
-        echo "We installed to: $LAST_INSTALL_PATH"
-        # Compare first PATH entry vs installed path
-        first="${bd_paths[0]}"
-        if [ "$first" != "$LAST_INSTALL_PATH" ]; then
-            log_warning "The 'bd' executable that appears first in your PATH is different from the one we installed. To make the newly installed 'bd' the one you get when running 'bd', either:"
-            echo "  - Remove or rename the older $first from your PATH, or"
-            echo "  - Reorder your PATH so that $(dirname "$LAST_INSTALL_PATH") appears before $(dirname "$first")"
-            echo "After updating PATH, restart your shell and run 'bd version' to confirm."
-        else
-            echo "The installed 'bd' is first in your PATH.";
-        fi
-    else
-        log_warning "We couldn't determine where we installed 'bd' during this run.";
-    fi
-}
-
-# Main installation flow
-main() {
-    echo ""
-    echo "🔗 Beads (bd) Installer"
-    echo ""
-
-    log_info "Detecting platform..."
-    local platform
-    platform=$(detect_platform)
-    log_info "Platform: $platform"
-
-    # Stop any running daemons before replacing binary
-    stop_existing_daemons
-
-    # Try downloading from GitHub releases first
-    if install_from_release "$platform"; then
-        verify_installation
-        exit 0
-    fi
-
-    log_warning "Failed to install from releases, trying alternative methods..."
-
-    # Try go install as fallback
-    if check_go; then
-        if install_with_go; then
-            verify_installation
-            exit 0
-        fi
-    fi
-
-    # Try building from source as last resort
-    log_warning "Falling back to building from source..."
-
-    if ! check_go; then
-        log_warning "Go is not installed"
-        echo ""
-        echo "bd requires Go 1.24 or later to build from source. You can:"
-        echo "  1. Install Go from https://go.dev/dl/"
-        echo "  2. Use your package manager:"
-        echo "     - macOS: brew install go"
-        echo "     - Ubuntu/Debian: sudo apt install golang"
-        echo "     - Other Linux: Check your distro's package manager"
-        echo ""
-        echo "After installing Go, run this script again."
+    local go_version
+    if ! go_version=$(ensure_go); then
+        print_error "Go 1.24 or later is required for building from source."
         exit 1
     fi
 
-    if build_from_source; then
-        verify_installation
+    print_info "Using Go $go_version"
+
+    local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
+    tmp_dir=$(make_tmp_dir)
+    src_dir="$tmp_dir/src"
+    repo_url="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
+
+    print_info "Fetching source..."
+
+    if command -v git >/dev/null 2>&1; then
+        if git clone --depth 1 "$repo_url" "$src_dir" >/dev/null 2>&1; then
+            fetched=1
+        else
+            print_warn "git clone failed, attempting tarball download..."
+        fi
+    fi
+
+    if [ "$fetched" -ne 1 ]; then
+        tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main"
+        tarball_path="$tmp_dir/source.tar.gz"
+        if ! download_file "$tarball_url" "$tarball_path"; then
+            print_error "Failed to download source tarball from GitHub."
+            exit 1
+        fi
+        tar -xzf "$tarball_path" -C "$tmp_dir"
+        src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
+        if [ -z "$src_dir" ]; then
+            print_error "Could not locate extracted source directory."
+            exit 1
+        fi
+    fi
+
+    print_info "Building $BIN_NAME from source..."
+    build_output="$tmp_dir/$BIN_NAME"
+    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
+        print_error "Go build failed."
+        exit 1
+    fi
+
+    ensure_install_dir "$INSTALL_DIR"
+    local dest_path="$INSTALL_DIR/$BIN_NAME"
+
+    if [ -w "$INSTALL_DIR" ]; then
+        mv "$build_output" "$dest_path"
+    else
+        print_info "Installing to $INSTALL_DIR requires sudo..."
+        sudo mv "$build_output" "$dest_path"
+    fi
+
+    # Re-sign for macOS to avoid Gatekeeper delays
+    resign_for_macos "$dest_path"
+
+    print_success "Built and installed $BIN_NAME from source to $dest_path"
+    return 0
+}
+
+main() {
+    print_info "Installing $BIN_NAME..."
+
+    local platform
+    platform=$(detect_platform) || {
+        print_warn "Could not detect platform, will try building from source"
+        try_go_install
+        exit 0
+    }
+
+    print_info "Detected platform: $platform"
+
+    # First, try to download pre-built binary
+    if try_binary_install "$platform"; then
+        print_info "Run '$BIN_NAME' in any project to manage issues."
         exit 0
     fi
 
-    # All methods failed
-    log_error "Installation failed"
-    echo ""
-    echo "Manual installation:"
-    echo "  1. Download from https://github.com/steveyegge/beads/releases/latest"
-    echo "  2. Extract and move 'bd' to your PATH"
-    echo ""
-    echo "Or install from source:"
-    echo "  1. Install Go from https://go.dev/dl/"
-    echo "  2. Run: go install github.com/steveyegge/beads/cmd/bd@latest"
-    echo ""
-    exit 1
+    # Fall back to building from source
+    print_info "Pre-built binary not available, falling back to source build..."
+    try_go_install
+
+    print_info "Run '$BIN_NAME' in any project to manage issues."
 }
 
-main "$@"
-
+if [[ ${BASH_SOURCE+x} != x ]]; then
+    main "$@"
+elif [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
