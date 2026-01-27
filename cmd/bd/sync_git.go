@@ -277,7 +277,7 @@ func gitCommitBeadsDir(ctx context.Context, message string) error {
 	}
 
 	// Check if anything was actually staged in .beads/ (exit code 1 = differences exist)
-	diffCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--", beadsDir) //nolint:gosec // G204: beadsDir from FindBeadsDir()
+	diffCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--", rc.BeadsDir) //nolint:gosec // G204: rc.BeadsDir from GetRepoContext()
 	if diffCmd.Run() == nil {
 		// No staged changes - nothing to commit
 		return nil
