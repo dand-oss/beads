@@ -103,18 +103,18 @@ bench-quick:
 	@echo "Running quick performance benchmarks..."
 	go test -bench=. -benchtime=100ms -benchmem -run=^$$ ./internal/storage/dolt/ -timeout=15m
 
-# Check that local branch is up to date with origin/main
+# Check that local branch is up to date with origin/master
 check-up-to-date:
 ifndef SKIP_UPDATE_CHECK
 	@# Skip check on detached HEAD (tag checkouts, CI builds)
 	@if ! git symbolic-ref HEAD >/dev/null 2>&1; then exit 0; fi
-	@git fetch origin main --quiet 2>/dev/null || true
+	@git fetch origin master --quiet 2>/dev/null || true
 	@LOCAL=$$(git rev-parse HEAD 2>/dev/null); \
-	REMOTE=$$(git rev-parse origin/main 2>/dev/null); \
+	REMOTE=$$(git rev-parse origin/master 2>/dev/null); \
 	if [ -n "$$REMOTE" ] && [ "$$LOCAL" != "$$REMOTE" ]; then \
-		echo "ERROR: Local branch is not up to date with origin/main"; \
+		echo "ERROR: Local branch is not up to date with origin/master"; \
 		echo "  Local:  $$(git rev-parse --short HEAD)"; \
-		echo "  Remote: $$(git rev-parse --short origin/main)"; \
+		echo "  Remote: $$(git rev-parse --short origin/master)"; \
 		echo "Run 'git pull' first, or use 'make install-force' to override"; \
 		exit 1; \
 	fi
@@ -122,7 +122,7 @@ endif
 
 # Install bd to ~/.local/bin (builds, signs on macOS, and copies)
 # Also creates 'beads' symlink as an alias for bd
-# Use install-force to skip the origin/main update check
+# Use install-force to skip the origin/master update check
 install install-force: build
 	@mkdir -p $(INSTALL_DIR)
 ifeq ($(OS),Windows_NT)
@@ -178,7 +178,7 @@ help:
 	@echo "  make bench        - Run performance benchmarks (generates CPU profiles)"
 	@echo "  make bench-quick  - Run quick benchmarks (shorter benchtime)"
 	@echo "  make install      - Install bd to ~/.local/bin (with codesign on macOS, includes 'beads' alias)"
-	@echo "  make install-force - Install bd, skipping the origin/main update check"
+	@echo "  make install-force - Install bd, skipping the origin/master update check"
 	@echo "  make fmt          - Format all Go files with gofmt"
 	@echo "  make fmt-check    - Check Go formatting (for CI)"
 	@echo "  make clean        - Remove build artifacts and profile files"
