@@ -3,7 +3,10 @@ name: beads
 description: >
   Git-backed issue tracker for multi-session work with dependencies and persistent
   memory across conversation compaction. Use when work spans sessions, has blockers,
-  or needs context recovery after compaction.
+  or needs context recovery after compaction. Trigger whenever the user asks to create
+  issues, track tasks, manage dependencies, remember insights across sessions, or
+  recover context after compaction. Also use for 'bd' commands, checking ready work,
+  or managing blockers. Use instead of TodoWrite or TaskCreate for persistent tracking.
 allowed-tools: "Read,Bash(bd:*)"
 version: "0.47.1"
 author: "Steve Yegge <https://github.com/steveyegge>"
